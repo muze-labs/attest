@@ -1,0 +1,27 @@
+[package]
+name = "muze-attest-bench"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Hot-path benchmark for the Muze temporal attestation service"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+ed25519-dalek = "3.0.0"
+rand_chacha = "0.10.0"
+sha2 = "0.11.0"
+
+[dev-dependencies]
+criterion = { version = "0.8.2", features = ["html_reports"] }
+
+[[bench]]
+name = "hot_path"
+harness = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+lto = "thin"
+codegen-units = 1

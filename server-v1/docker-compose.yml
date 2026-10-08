@@ -1,0 +1,10 @@
+services:
+  attest:
+    build: .
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./data:/app/data
+    environment:
+      MUZE_ATTEST_BIND: 0.0.0.0:3000
+      MUZE_ATTEST_ISSUER: Muze Temporal Attestation Service

@@ -1,0 +1,13 @@
+FROM rust:1.90-bookworm AS build
+WORKDIR /src
+COPY . .
+RUN cargo build --release
+
+FROM debian:bookworm-slim
+RUN useradd --system --uid 10001 attest && mkdir -p /app/data && chown -R attest:attest /app
+WORKDIR /app
+COPY --from=build /src/target/release/muze-temporal-attestation /usr/local/bin/muze-temporal-attestation
+USER attest
+ENV MUZE_ATTEST_BIND=0.0.0.0:3000
+EXPOSE 3000
+CMD ["muze-temporal-attestation", "serve"]
