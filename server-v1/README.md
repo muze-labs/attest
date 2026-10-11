@@ -13,7 +13,8 @@ The service never needs the source data. Clients hash locally and send only a 32
 - `POST /v1/attest`: high-throughput binary attestation API.
 - Public Ed25519 key disclosure at `/keys`, `/v1/keys/current`, `/v1/keys/current.raw`, and a `.well-known` URL.
 - `/decode`: browser decoder/verifier explaining what an attestation means.
-- `/health`: discloses clock behavior and prototype limitations.
+- `/health`: human-readable live clock health, source list, offsets, thresholds, and issuance decision.
+- `/v1/health`: machine-readable clock/service health.
 - Canonical 127-byte binary attestation format.
 - Textual `mta1_<base64url>` representation for copy/paste.
 - Separate `format_version` and `assurance_level` fields.
@@ -42,6 +43,9 @@ Configuration:
 MUZE_ATTEST_BIND=0.0.0.0:3000
 MUZE_ATTEST_KEY=/secure/path/signing.key
 MUZE_ATTEST_ISSUER='Muze Temporal Attestation Service'
+MUZE_ATTEST_NTP_MIN_VALID=3
+MUZE_ATTEST_NTP_SOURCE_THRESHOLD_MS=100
+MUZE_ATTEST_NTP_LOCAL_THRESHOLD_MS=250
 cargo run --release -- serve
 ```
 
@@ -106,11 +110,30 @@ It does **not** prove:
 
 Independent anchoring and bounded-time challenges are intended as separate, stronger assurance levels later.
 
-## Clock limitation in this prototype
+## Clock health
 
-The server uses the host's system UTC clock and refuses to issue attestations if the observed clock moves backwards during the process lifetime.
+Clock health is part of the assurance-level-1 trust boundary. The service cross-checks its host UTC clock against five independently operated public NTP services:
 
-External NTP/time-source health verification is **not yet implemented**. `/health` discloses this. Before treating this as production temporal infrastructure, add explicit clock-source monitoring and fail-closed policy.
+- `time.cloudflare.com` — Cloudflare
+- `time.nist.gov` — NIST
+- `time.windows.com` — Microsoft
+- `ntp.ubuntu.com` — Canonical / Ubuntu
+- `time.meta.com` — Meta
+
+Defaults:
+
+- check all five in parallel every 30 seconds;
+- require at least 3 valid sources;
+- reject a source if it differs by more than 100 ms from the median of reachable sources;
+- refuse issuance if the median of valid sources says the local clock differs by more than 250 ms;
+- refuse issuance if clock-health information is more than 90 seconds old;
+- retain the in-process guard that refuses issuance if the local clock moves backwards.
+
+The human-readable `/health` page publishes the source list, current offsets, source status, thresholds, and issuance decision. `/v1/health` provides the same information as JSON.
+
+These checks currently use ordinary NTP rather than cryptographically authenticated NTS. They protect well against accidental clock errors and isolated bad sources, but NTS is an appropriate later hardening step.
+
+All clock-health settings can be changed with environment variables documented by `--help`.
 
 ## Tests
 

@@ -1,0 +1,32 @@
+[package]
+name = "muze-attest-bench"
+version = "0.4.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Hot-path, HTTP, and hierarchical Merkle benchmark for the Muze temporal attestation service"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+bytes = "1.12.1"
+ed25519-dalek = "3.0.0"
+http-body-util = "0.1.5"
+hyper = { version = "1.12.0", features = ["http1", "server"] }
+hyper-util = { version = "0.1.21", features = ["tokio"] }
+rand_chacha = "0.10.0"
+sha2 = "0.11.0"
+tokio = { version = "1.53.2", features = ["macros", "net", "rt-multi-thread", "signal"] }
+
+[dev-dependencies]
+criterion = { version = "0.8.2", features = ["html_reports"] }
+
+[[bench]]
+name = "hot_path"
+harness = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+lto = "thin"
+codegen-units = 1

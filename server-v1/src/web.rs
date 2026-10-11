@@ -1,10 +1,13 @@
-use crate::attestation::{self, ASSURANCE_LEVEL_1, ATTESTATION_LEN, HASH_ALG_SHA256};
+use crate::{
+    attestation::{self, ASSURANCE_LEVEL_1, ATTESTATION_LEN, HASH_ALG_SHA256},
+    clock::{self, ClockMonitor},
+};
 use bytes::Bytes;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use http_body_util::{BodyExt, Full};
 use hyper::{body::Incoming, header, Method, Request, Response, StatusCode};
 use sha2::{Digest, Sha256};
-use std::{convert::Infallible, sync::{Arc, Mutex}, time::{SystemTime, UNIX_EPOCH}};
+use std::{convert::Infallible, sync::{Arc, Mutex}};
 
 pub type RespBody = Full<Bytes>;
 
@@ -13,27 +16,27 @@ pub struct AppState {
     pub signing_key: Arc<SigningKey>,
     pub issuer_name: Arc<String>,
     pub public_base_url: Arc<String>,
+    pub clock_monitor: ClockMonitor,
     last_timestamp_ms: Arc<Mutex<i64>>,
 }
 
 impl AppState {
-    pub fn new(signing_key: SigningKey, issuer_name: String, public_base_url: String) -> Self {
+    pub fn new(signing_key: SigningKey, issuer_name: String, public_base_url: String, clock_monitor: ClockMonitor) -> Self {
         Self {
             signing_key: Arc::new(signing_key),
             issuer_name: Arc::new(issuer_name),
             public_base_url: Arc::new(public_base_url),
+            clock_monitor,
             last_timestamp_ms: Arc::new(Mutex::new(0)),
         }
     }
 
-    fn safe_now_ms(&self) -> Result<i64, &'static str> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| "system clock is before Unix epoch")?;
-        let ms = i64::try_from(now.as_millis()).map_err(|_| "system clock out of supported range")?;
-        let mut last = self.last_timestamp_ms.lock().map_err(|_| "clock guard unavailable")?;
+    fn safe_now_ms(&self) -> Result<i64, String> {
+        self.clock_monitor.is_healthy_and_fresh()?;
+        let ms = clock::system_time_ms().map_err(|e| e.to_string())?;
+        let mut last = self.last_timestamp_ms.lock().map_err(|_| "clock guard unavailable".to_string())?;
         if ms < *last {
-            return Err("system clock moved backwards; refusing to attest");
+            return Err("system clock moved backwards; refusing to attest".into());
         }
         *last = ms;
         Ok(ms)
@@ -49,7 +52,8 @@ pub async fn handle(req: Request<Incoming>, state: AppState) -> Result<Response<
         (Method::GET, "/about") => html(StatusCode::OK, &about_page(&state)),
         (Method::GET, "/decode") => html(StatusCode::OK, &decode_page()),
         (Method::GET, "/keys") => html(StatusCode::OK, &keys_page(&state)),
-        (Method::GET, "/health") => health(&state),
+        (Method::GET, "/health") => html(StatusCode::OK, &health_page(&state)),
+        (Method::GET, "/v1/health") => health_json(&state),
         (Method::GET, "/v1/keys/current") => key_json(&state),
         (Method::GET, "/v1/keys/current.raw") => key_raw(&state),
         (Method::GET, "/.well-known/muze-temporal-attestation-key.json") => key_json(&state),
@@ -132,12 +136,104 @@ fn key_json(state: &AppState) -> Response<RespBody> {
     json(StatusCode::OK, &body)
 }
 
-fn health(state: &AppState) -> Response<RespBody> {
-    let clock = match state.safe_now_ms() {
-        Ok(ms) => format!("{{\"status\":\"ok\",\"clock\":\"system UTC with in-process backwards-clock guard\",\"timestampMs\":{ms},\"externalNtpHealthCheck\":false}}"),
-        Err(e) => format!("{{\"status\":\"unhealthy\",\"error\":{}}}", json_string(e)),
-    };
-    json(StatusCode::OK, &clock)
+fn health_json(state: &AppState) -> Response<RespBody> {
+    let snapshot = state.clock_monitor.snapshot();
+    let config = state.clock_monitor.config();
+    let fresh = state.clock_monitor.is_healthy_and_fresh().is_ok();
+    let status = if snapshot.healthy && fresh { "ok" } else { "unhealthy" };
+    let checked_at = snapshot.checked_at_ms.map(iso8601_utc_ms);
+    let sources = snapshot.sources.iter().map(|source| {
+        format!(
+            "{{\"name\":{},\"reachable\":{},\"valid\":{},\"offsetMs\":{},\"roundTripMs\":{},\"stratum\":{},\"error\":{}}}",
+            json_string(&source.source),
+            source.reachable,
+            source.valid,
+            json_number_opt(source.offset_ms),
+            json_number_opt(source.round_trip_ms),
+            source.stratum.map(|v| v.to_string()).unwrap_or_else(|| "null".into()),
+            source.error.as_deref().map(json_string).unwrap_or_else(|| "null".into()),
+        )
+    }).collect::<Vec<_>>().join(",");
+    let body = format!(
+        "{{\"status\":{},\"issuingAttestations\":{},\"reason\":{},\"checkedAt\":{},\"medianOffsetMs\":{},\"validSources\":{},\"configuredSources\":{},\"minimumValidSources\":{},\"sourceThresholdMs\":{},\"localThresholdMs\":{},\"checkIntervalSeconds\":{},\"staleAfterSeconds\":{},\"queryTimeoutMs\":{},\"sources\":[{}]}}",
+        json_string(status),
+        snapshot.healthy && fresh,
+        json_string(&snapshot.reason),
+        checked_at.as_deref().map(json_string).unwrap_or_else(|| "null".into()),
+        json_number_opt(snapshot.median_offset_ms),
+        snapshot.valid_sources,
+        config.sources.len(),
+        config.min_valid_sources,
+        config.source_threshold_ms,
+        config.local_threshold_ms,
+        config.check_interval.as_secs(),
+        config.stale_after.as_secs(),
+        config.query_timeout.as_millis(),
+        sources,
+    );
+    let code = if snapshot.healthy && fresh { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+    json(code, &body)
+}
+
+fn health_page(state: &AppState) -> String {
+    let snapshot = state.clock_monitor.snapshot();
+    let config = state.clock_monitor.config();
+    let fresh = state.clock_monitor.is_healthy_and_fresh().is_ok();
+    let healthy = snapshot.healthy && fresh;
+    let checked_at = snapshot.checked_at_ms
+        .map(iso8601_utc_ms)
+        .unwrap_or_else(|| "not checked yet".into());
+    let median = snapshot.median_offset_ms
+        .map(|v| format!("{v:+.3} ms"))
+        .unwrap_or_else(|| "unavailable".into());
+    let rows = snapshot.sources.iter().map(|source| {
+        let status = if source.valid { "valid" } else if source.reachable { "rejected" } else { "unreachable" };
+        let offset = source.offset_ms.map(|v| format!("{v:+.3} ms")).unwrap_or_else(|| "—".into());
+        let rtt = source.round_trip_ms.map(|v| format!("{v:.3} ms")).unwrap_or_else(|| "—".into());
+        let stratum = source.stratum.map(|v| v.to_string()).unwrap_or_else(|| "—".into());
+        let note = source.error.as_deref().unwrap_or("");
+        format!(
+            "<tr><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            html_escape(&source.source), status, offset, rtt, stratum, html_escape(note)
+        )
+    }).collect::<Vec<_>>().join("\n");
+
+    page("Clock health", &format!(r#"
+<h1>Clock health</h1>
+<p class="lead"><strong>{status}</strong> — issuing attestations: <strong>{issuing}</strong></p>
+<p>{reason}</p>
+<dl>
+<dt>Last check</dt><dd>{checked_at}</dd>
+<dt>Valid sources</dt><dd>{valid} of {configured}; minimum {minimum}</dd>
+<dt>Median local-clock offset</dt><dd>{median}</dd>
+<dt>Maximum source disagreement</dt><dd>±{source_threshold:.0} ms from source median</dd>
+<dt>Maximum local clock offset</dt><dd>±{local_threshold:.0} ms</dd>
+<dt>Check interval</dt><dd>{interval} seconds</dd>
+<dt>Health expires after</dt><dd>{stale} seconds without a successful fresh check</dd>
+<dt>Per-source query timeout</dt><dd>{timeout} ms</dd>
+</dl>
+<h2>Clock sources</h2>
+<p>The service checks {configured} independently operated public NTP sources. A source that differs from the source median by more than the configured threshold is rejected. The service requires at least three valid sources, and separately requires their median to agree with the local system clock.</p>
+<table><thead><tr><th>Source</th><th>Status</th><th>Offset</th><th>RTT</th><th>Stratum</th><th>Note</th></tr></thead><tbody>{rows}</tbody></table>
+<h2>Trust note</h2>
+<p>These checks use ordinary NTP as a cross-check of the local clock. They substantially reduce accidental clock errors and single-source failures, but ordinary NTP is not cryptographically authenticated. Network Time Security (NTS) is a possible later hardening step.</p>
+<p>Machine-readable status: <a href="/v1/health"><code>/v1/health</code></a>.</p>
+"#,
+        status=if healthy { "HEALTHY" } else { "UNHEALTHY" },
+        issuing=if healthy { "YES" } else { "NO" },
+        reason=html_escape(&snapshot.reason),
+        checked_at=html_escape(&checked_at),
+        valid=snapshot.valid_sources,
+        configured=config.sources.len(),
+        minimum=config.min_valid_sources,
+        median=median,
+        source_threshold=config.source_threshold_ms,
+        local_threshold=config.local_threshold_ms,
+        interval=config.check_interval.as_secs(),
+        stale=config.stale_after.as_secs(),
+        timeout=config.query_timeout.as_millis(),
+        rows=rows,
+    ))
 }
 
 fn hash_alg_name(id: u8) -> &'static str {
@@ -233,7 +329,8 @@ total: 127 bytes</pre>
 <h2>Versions are separate from assurance</h2>
 <p>The format version tells software how to parse an attestation. The assurance level tells a verifier what guarantee the attestation claims. API versioning is separately expressed by the URL path.</p>
 <h2>Clock status</h2>
-<p>This prototype uses the host system UTC clock plus an in-process backwards-clock guard. External NTP-health verification is intentionally disclosed as not yet implemented and is visible at <a href="/health">/health</a>.</p>
+<p>The service checks its local clock against five independently operated public NTP sources. At least three must agree within the configured source threshold, and their median must remain within the configured local-clock threshold. Clock-health data also expires if checks become stale. If any of those conditions fail, attestation issuance fails closed.</p>
+<p>The configured sources, offsets, thresholds, and current issuance decision are public at <a href="/health">/health</a>.</p>
 "#, issuer=html_escape(&state.issuer_name)))
 }
 
@@ -309,6 +406,8 @@ button,.button {{ display:inline-block; padding:.65rem .95rem; border:1px solid 
 .button.secondary {{ opacity:.75; }}
 dt {{ font-weight:700; margin-top:1rem; }} dd {{ margin-left:0; overflow-wrap:anywhere; }}
 blockquote {{ border-left:4px solid currentColor; padding-left:1rem; margin-left:0; font-size:1.15rem; }}
+table {{ width:100%; border-collapse:collapse; font-size:.95rem; }}
+th, td {{ text-align:left; padding:.55rem .45rem; border-bottom:1px solid #8885; vertical-align:top; }}
 footer {{ margin-top:4rem; opacity:.7; font-size:.9rem; }}
 </style>
 </head>
@@ -340,6 +439,13 @@ fn json(status: StatusCode, s: &str) -> Response<RespBody> {
     r.headers_mut().insert(header::CONTENT_TYPE, header::HeaderValue::from_static("application/json; charset=utf-8"));
     r.headers_mut().insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store"));
     r
+}
+
+fn json_number_opt(v: Option<f64>) -> String {
+    match v {
+        Some(n) if n.is_finite() => format!("{n:.3}"),
+        _ => "null".into(),
+    }
 }
 
 fn json_string(s: &str) -> String {

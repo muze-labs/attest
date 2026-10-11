@@ -70,6 +70,15 @@ The verifier trusts:
 
 The signature protects integrity and issuer authenticity. It does not independently prove clock honesty.
 
+
+## Issuer clock-health requirement
+
+For the Muze reference service, assurance level 1 is issued only while the service clock is healthy. The current implementation cross-checks the local UTC clock against five public NTP operators, requires a 3-of-5 quorum after source-outlier rejection, requires the valid-source median to remain within the configured local-clock threshold, expires stale health state, and retains an in-process backwards-clock guard.
+
+Clock-health policy is an issuer operational property rather than part of the 127-byte attestation format. A relying party still decides whether it trusts the issuer's clock operation. The reference service publishes its current clock sources, thresholds, offsets, and issuance decision at `/health` and `/v1/health`.
+
+Ordinary NTP is not cryptographically authenticated; stronger future deployments may use NTS or higher assurance levels with independent anchoring.
+
 ## Verification
 
 1. Parse exactly 127 bytes.

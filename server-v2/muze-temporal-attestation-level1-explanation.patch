@@ -1,0 +1,42 @@
+--- a/src/web.rs
++++ b/src/web.rs
+@@ -304,15 +304,23 @@
+ <li>The server reads its UTC clock, builds the attestation body, and signs it with Ed25519.</li>
+ <li>The completed attestation is returned immediately. The service does not need to store it.</li>
+ </ol>
+-<h2>What it proves</h2>
++<h2>What Assurance Level 1 proves</h2>
+ <blockquote>{issuer} attests that it had received this exact commitment no later than the signed time.</blockquote>
++<p>A Level 1 attestation establishes an <strong>upper bound on when these exact committed bytes must already have existed</strong>.</p>
++<p>For example, a document may contain a date claiming it was created on 1 January. If its Muze attestation is dated 8 October, the attestation provides no evidence that the document existed in January. It establishes only that these exact bytes existed by 8 October.</p>
++<p>This makes retrospective fabrication detectable: someone cannot create evidence today, put an old date inside it, and use a later Muze attestation as proof that the evidence already existed on that old date.</p>
++<h2>What you are trusting</h2>
++<p>Level 1 relies on trusting {issuer} to operate its clock and signing service honestly. The cryptographic signature proves that Muze issued the attestation and that the signed digest, timestamp, assurance level, and other signed fields have not been changed.</p>
++<p>The service checks its local clock against multiple independent public time sources before issuing attestations. However, the Level 1 attestation by itself cannot cryptographically prevent Muze from deliberately signing a false historical timestamp. A future independently anchored assurance level can provide that stronger guarantee.</p>
+ <h2>What it does not prove</h2>
+ <ul>
+-<li>It does not prove the underlying statement is true.</li>
++<li>It does not prove the contents of the data are true.</li>
+ <li>It does not prove who created the underlying data.</li>
++<li>It does not prove that dates written inside the data are correct.</li>
+ <li>It does not prove when the underlying data was first created.</li>
+-<li>Assurance level 1 does not protect against a dishonest issuer deliberately backdating an attestation.</li>
++<li>It does not prove that the data did not exist before the attested time.</li>
+ </ul>
++<p><strong>In short:</strong> these exact committed bytes existed no later than the signed timestamp, assuming the Muze Temporal Attestation Service is trusted to operate its clock and signing service honestly.</p>
+ <h2>Binary format</h2>
+ <pre>offset  size  field
+ 0       4     magic: "MTA\\0"
+@@ -359,6 +367,12 @@
+ <textarea id="input" rows="8" placeholder="mta1_..."></textarea>
+ <p><button id="decode">Decode</button></p>
+ <pre id="output">No attestation decoded yet.</pre>
++<section class="assurance-note">
++<h2>How to interpret Assurance Level 1</h2>
++<p><strong>What it establishes:</strong> the exact content represented by the signed digest existed no later than the attested timestamp.</p>
++<p>A date written inside the content is only part of the content. If the content claims an earlier date, the attestation does not prove that earlier date; it proves only that the exact committed bytes existed by the Muze timestamp.</p>
++<p><strong>Trust assumption:</strong> Level 1 relies on trusting the Muze Temporal Attestation Service to operate its clock and signing service honestly. The signature prevents anyone else from altering the timestamp or digest without detection, but Level 1 does not independently prevent Muze itself from signing a false historical timestamp.</p>
++</section>
+ <script>
+ function fromB64url(s) {
+   s = s.replaceAll('-','+').replaceAll('_','/');

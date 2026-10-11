@@ -1,4 +1,5 @@
 mod attestation;
+mod clock;
 mod key;
 mod web;
 
@@ -7,7 +8,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use sha2::{Digest, Sha256};
-use std::{env, fs, net::SocketAddr, path::{Path, PathBuf}};
+use std::{env, fs, net::SocketAddr, path::{Path, PathBuf}, time::Duration};
 use tokio::net::TcpListener;
 use web::AppState;
 
@@ -31,6 +32,29 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     let issuer = env::var("MUZE_ATTEST_ISSUER").unwrap_or_else(|_| "Muze Temporal Attestation Service".into());
     let public_base = env::var("MUZE_ATTEST_PUBLIC_BASE_URL").unwrap_or_else(|_| format!("http://{bind}"));
 
+    let mut clock_config = clock::ClockConfig::default();
+    if let Ok(sources) = env::var("MUZE_ATTEST_NTP_SOURCES") {
+        clock_config.sources = sources
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+    }
+    clock_config.min_valid_sources = env_usize("MUZE_ATTEST_NTP_MIN_VALID", clock_config.min_valid_sources)?;
+    clock_config.source_threshold_ms = env_f64("MUZE_ATTEST_NTP_SOURCE_THRESHOLD_MS", clock_config.source_threshold_ms)?;
+    clock_config.local_threshold_ms = env_f64("MUZE_ATTEST_NTP_LOCAL_THRESHOLD_MS", clock_config.local_threshold_ms)?;
+    clock_config.check_interval = Duration::from_secs(env_u64("MUZE_ATTEST_NTP_CHECK_INTERVAL_SECS", clock_config.check_interval.as_secs())?);
+    clock_config.stale_after = Duration::from_secs(env_u64("MUZE_ATTEST_NTP_STALE_AFTER_SECS", clock_config.stale_after.as_secs())?);
+    clock_config.query_timeout = Duration::from_millis(env_u64("MUZE_ATTEST_NTP_TIMEOUT_MS", clock_config.query_timeout.as_millis() as u64)?);
+
+    if clock_config.sources.len() < clock_config.min_valid_sources {
+        return Err(format!("MUZE_ATTEST_NTP_MIN_VALID={} but only {} NTP sources are configured", clock_config.min_valid_sources, clock_config.sources.len()).into());
+    }
+
+    let clock_monitor = clock::ClockMonitor::new(clock_config);
+    clock_monitor.clone().spawn();
+
     let (signing_key, created) = key::load_or_create(&key_path)?;
     if created {
         eprintln!("Generated new Ed25519 signing key at {}", key_path.display());
@@ -42,9 +66,10 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("Issuer: {issuer}");
     eprintln!("Key ID: {kid}");
     eprintln!("Assurance level: 1 (trusted issuer upper-bound timestamp)");
-    eprintln!("Clock note: prototype uses system UTC + in-process backwards-clock guard; external NTP health verification not implemented.");
+    eprintln!("Clock health: NTP consensus enabled ({} sources, minimum {} valid)", clock_monitor.config().sources.len(), clock_monitor.config().min_valid_sources);
+    eprintln!("Clock sources: {}", clock_monitor.config().sources.join(", "));
 
-    let state = AppState::new(signing_key, issuer, public_base);
+    let state = AppState::new(signing_key, issuer, public_base, clock_monitor);
     let listener = TcpListener::bind(bind).await?;
     loop {
         tokio::select! {
@@ -136,6 +161,30 @@ fn hash_cmd(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn env_usize(name: &str, default: usize) -> Result<usize, Box<dyn std::error::Error>> {
+    match env::var(name) {
+        Ok(v) => Ok(v.parse().map_err(|e| format!("invalid {name}={v:?}: {e}"))?),
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn env_u64(name: &str, default: u64) -> Result<u64, Box<dyn std::error::Error>> {
+    match env::var(name) {
+        Ok(v) => Ok(v.parse().map_err(|e| format!("invalid {name}={v:?}: {e}"))?),
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn env_f64(name: &str, default: f64) -> Result<f64, Box<dyn std::error::Error>> {
+    match env::var(name) {
+        Ok(v) => Ok(v.parse().map_err(|e| format!("invalid {name}={v:?}: {e}"))?),
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(e) => Err(e.into()),
+    }
+}
+
 fn help() {
     println!(r#"Muze Temporal Attestation Service prototype
 
@@ -151,10 +200,18 @@ SERVER ENVIRONMENT:
   MUZE_ATTEST_KEY              default data/signing.key
   MUZE_ATTEST_ISSUER           default "Muze Temporal Attestation Service"
   MUZE_ATTEST_PUBLIC_BASE_URL  informational base URL
+  MUZE_ATTEST_NTP_SOURCES      comma-separated NTP hosts
+  MUZE_ATTEST_NTP_MIN_VALID    default 3
+  MUZE_ATTEST_NTP_SOURCE_THRESHOLD_MS  default 100
+  MUZE_ATTEST_NTP_LOCAL_THRESHOLD_MS   default 250
+  MUZE_ATTEST_NTP_CHECK_INTERVAL_SECS  default 30
+  MUZE_ATTEST_NTP_STALE_AFTER_SECS     default 90
+  MUZE_ATTEST_NTP_TIMEOUT_MS            default 2000
 
 API:
   POST /v1/attest              request body = exactly 32 raw SHA-256 digest bytes
   GET  /v1/keys/current        current public key metadata
+  GET  /v1/health              machine-readable clock/service health
   POST /v1/decode              verify and explain one raw 127-byte attestation
 "#);
 }
